@@ -1,7 +1,7 @@
 import asyncio, warnings, copy, time
 
 class BaseNode:
-    def __init__(self): self.params,self.successors={},{}
+    def __init__(self): self.params,self.successors,self.flow_control={},{},self
     def set_params(self,params): self.params=params
     def next(self,node,action="default"):
         if action in self.successors: warnings.warn(f"Overwriting successor for action '{action}'")
@@ -37,15 +37,19 @@ class BatchNode(Node):
     def _exec(self,items): return [super(BatchNode,self)._exec(i) for i in (items or [])]
 
 class Flow(BaseNode):
-    def __init__(self,start=None): super().__init__(); self.start_node=start
+    def __init__(self,start=None): super().__init__(); self.start_node=start; self.stop_flow = False
     def start(self,start): self.start_node=start; return start
     def get_next_node(self,curr,action):
+        if not isinstance(action, str): action = "default"
         nxt=curr.successors.get(action or "default")
         if not nxt and curr.successors: warnings.warn(f"Flow ends: '{action}' not found in {list(curr.successors)}")
         return nxt
     def _orch(self,shared,params=None):
         curr,p,last_action =copy.copy(self.start_node),(params or {**self.params}),None
-        while curr: curr.set_params(p); last_action=curr._run(shared); curr=copy.copy(self.get_next_node(curr,last_action))
+        while curr:
+            if self.stop_flow: break
+            curr.flow_control = self # Propagate flow control object
+            curr.set_params(p); last_action=curr._run(shared); curr=copy.copy(self.get_next_node(curr,last_action))
         return last_action
     def _run(self,shared): p=self.prep(shared); o=self._orch(shared); return self.post(shared,p,o)
     def post(self,shared,prep_res,exec_res): return exec_res
@@ -82,7 +86,10 @@ class AsyncParallelBatchNode(AsyncNode,BatchNode):
 class AsyncFlow(Flow,AsyncNode):
     async def _orch_async(self,shared,params=None):
         curr,p,last_action =copy.copy(self.start_node),(params or {**self.params}),None
-        while curr: curr.set_params(p); last_action=await curr._run_async(shared) if isinstance(curr,AsyncNode) else curr._run(shared); curr=copy.copy(self.get_next_node(curr,last_action))
+        while curr:
+            if self.stop_flow: break
+            curr.flow_control = self # Propagate flow control object
+            curr.set_params(p); last_action=await curr._run_async(shared) if isinstance(curr, AsyncNode) else curr._run(shared); curr=copy.copy(self.get_next_node(curr,last_action))
         return last_action
     async def _run_async(self,shared): p=await self.prep_async(shared); o=await self._orch_async(shared); return await self.post_async(shared,p,o)
     async def post_async(self,shared,prep_res,exec_res): return exec_res
@@ -95,6 +102,8 @@ class AsyncBatchFlow(AsyncFlow,BatchFlow):
 
 class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
     async def _run_async(self,shared): 
-        pr=await self.prep_async(shared) or []
-        await asyncio.gather(*(self._orch_async(shared,{**self.params,**bp}) for bp in pr))
-        return await self.post_async(shared,pr,None)
+        pr = await self.prep_async(shared) or []
+        # Correctly capture the results from asyncio.gather
+        exec_results = await asyncio.gather(*(self._orch_async(shared,{**self.params,**bp}) for bp in pr))
+        # Pass the collected results to post_async for aggregation
+        return await self.post_async(shared, pr, exec_results)
